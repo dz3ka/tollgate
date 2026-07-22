@@ -1,0 +1,14 @@
+# Rust build output
+/target
+
+# Local env / secrets — never commit real values
+.env
+.env.local
+*.pem
+*.key
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

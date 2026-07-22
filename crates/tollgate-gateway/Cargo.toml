@@ -1,0 +1,36 @@
+[package]
+name = "tollgate-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tollgate-core = { path = "../tollgate-core" }
+tollgate-middleware = { path = "../tollgate-middleware" }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+[dev-dependencies]
+# Crypto stack for the e2e signing harness (mirrors tollgate-core's versions).
+# The HTTP/runtime crates the test needs (hyper, hyper-util, http, http-body-util,
+# bytes, serde_json, tokio, axum) are inherited from [dependencies] above —
+# integration tests link the crate's normal deps too.
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+alloy-primitives = { version = "1", default-features = false, features = ["std", "k256"] }
+alloy-sol-types = { version = "1", default-features = false, features = ["std"] }
+base64 = "0.22"

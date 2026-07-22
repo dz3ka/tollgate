@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rustup on the runner reads rust-toolchain.toml and auto-installs the
+      # pinned toolchain (plus rustfmt + clippy) on the first cargo call, so no
+      # explicit toolchain-install step is needed.
+      - uses: Swatinem/rust-cache@v2
+      - name: ci (fmt-check, build, clippy, test)
+        run: make ci

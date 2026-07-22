@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+authors = ["Bogdan Dzekic"]
+repository = "https://github.com/dz3ka/tollgate"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

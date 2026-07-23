@@ -15,7 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_sol_types::{eip712_domain, sol, SolStruct};
@@ -50,9 +50,9 @@ const DOMAIN_VERSION: &str = "2";
 const AMOUNT: &str = "10000";
 /// Base Sepolia's EIP-712 chain id (see `verify::chain_id`).
 const CHAIN_ID: u64 = 84_532;
-/// A far-future `validBefore`: the middleware verifies against real wall-clock
-/// time, so this must genuinely lie ahead of now.
-const VALID_BEFORE: u64 = 9_999_999_999;
+/// The `maxTimeoutSeconds` the fixture challenge advertises — and therefore the
+/// longest validity window `verify_payment` will accept for a payment against it.
+const MAX_TIMEOUT_SECS: u64 = 3_600;
 /// The stub upstream's known response body — proves end-to-end relay.
 const UPSTREAM_BODY: &str = "hello from upstream";
 /// A benign custom header the client names in `Connection` on the paid request.
@@ -94,7 +94,7 @@ async fn gateway_gates_then_proxies_then_blocks_replay() {
         ASSET.parse().expect("asset is valid hex"),
         AMOUNT.parse().expect("amount is decimal"),
         "http://localhost/",
-        60,
+        MAX_TIMEOUT_SECS,
     )
     .extra(serde_json::json!({ "name": DOMAIN_NAME, "version": DOMAIN_VERSION }))
     .build();
@@ -273,7 +273,13 @@ fn build_payment_header() -> String {
 
     let value = U256::from_str_radix(AMOUNT, 10).expect("amount");
     let valid_after = U256::ZERO;
-    let valid_before = U256::from(VALID_BEFORE);
+    // Derived from the real clock rather than a far-future constant: the gate now
+    // refuses an authorization that stays valid for longer than the challenge's
+    // `maxTimeoutSeconds` advertised, and a year-2286 deadline is precisely that.
+    // Read ONCE — signing it and writing it into the JSON from two different reads
+    // would produce a signature over a different deadline than the one sent.
+    let valid_before_secs = now_unix() + MAX_TIMEOUT_SECS;
+    let valid_before = U256::from(valid_before_secs);
     // A fixed nonce is fine: the replay test deliberately re-sends this header.
     let nonce_bytes = [0x11u8; 32];
     let nonce = B256::from(nonce_bytes);
@@ -315,11 +321,20 @@ fn build_payment_header() -> String {
                 "to": to.to_string(),
                 "value": AMOUNT,
                 "validAfter": "0",
-                "validBefore": VALID_BEFORE.to_string(),
+                "validBefore": valid_before_secs.to_string(),
                 "nonce": format!("0x{}", alloy_primitives::hex::encode(nonce_bytes)),
             }
         }
     });
     let json = serde_json::to_string(&payload).expect("serialize payload");
     base64::engine::general_purpose::STANDARD.encode(json)
+}
+
+/// Wall-clock unix seconds: the same clock the gate verifies the authorization
+/// against, so the fixture's deadline has to be expressed in it.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the system clock is after the unix epoch")
+        .as_secs()
 }

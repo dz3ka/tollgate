@@ -16,6 +16,7 @@ use alloy_primitives::{keccak256, Address, Signature, B256, U256};
 
 use super::payment::PaymentPayload;
 use super::types::{EvmAddress, Network, Nonce, PaymentRequirements, Scheme, UintStr};
+use super::CLOCK_SKEW_GRACE_SECONDS;
 
 /// A payment failed cryptographic or policy verification.
 ///
@@ -60,6 +61,13 @@ pub enum VerifyError {
     /// The current time is at or after the authorization's `validBefore`.
     #[error("expired: current time is at or after validBefore")]
     Expired,
+    /// The authorization stays valid for longer than the challenge advertised,
+    /// by more than [`CLOCK_SKEW_GRACE_SECONDS`](crate::x402::CLOCK_SKEW_GRACE_SECONDS).
+    #[error(
+        "validity window too long: validBefore is beyond now plus maxTimeoutSeconds and the \
+         clock-skew grace"
+    )]
+    ValidityWindowTooLong,
     /// The signature was not `0x` + 130 hex, or its `v` byte was out of range.
     #[error("signature format: expected 0x + 130 hex characters with a valid recovery id")]
     SignatureFormat,
@@ -150,6 +158,30 @@ pub fn verify_payment(
     if now >= valid_before {
         return Err(VerifyError::Expired);
     }
+    // `maxTimeoutSeconds` is what the challenge PROMISED the authorization would
+    // have to live for; the payer picks `validBefore` and may pick any future they
+    // like. Unbounded, a signature accepted now can stay redeemable for days, and
+    // everything downstream that assumes a claim's life is short — settlement's
+    // bounded `eth_getLogs` lookback most of all — silently becomes wrong. The
+    // window is therefore closed at the edge that accepts the payment rather than
+    // patched wherever the assumption is used.
+    //
+    // The grace is not slop: the payer computes `validBefore` as `THEIR now +
+    // maxTimeoutSeconds` — the reference x402 client does exactly that — and the bound
+    // is evaluated against OURS, so any clock difference lands squarely on this
+    // comparison. With a default `maxTimeoutSeconds` of 60, a zero-tolerance bound
+    // rejects a client one second fast, permanently: re-signing reproduces the same
+    // `validBefore`. It costs nothing to allow, either. What the bound is really
+    // protecting is the settler's `LOG_LOOKBACK_BLOCKS` premise, which only needs
+    // `validBefore - now` to stay far below ~5.5 hours; 300 seconds of extra slack is
+    // invisible against that headroom.
+    if valid_before
+        > now
+            .saturating_add(U256::from(requirements.max_timeout_seconds))
+            .saturating_add(U256::from(CLOCK_SKEW_GRACE_SECONDS))
+    {
+        return Err(VerifyError::ValidityWindowTooLong);
+    }
 
     // 6. Reconstruct the digest, recover the signer, and compare to `from`.
     let digest = eip712_digest(
@@ -182,7 +214,13 @@ pub fn verify_payment(
 /// let a signature minted for another chain be accepted here, so only vetted,
 /// testnet-targeted ids are listed. Everything else (mainnets we do not settle
 /// on, all Solana variants, `Unknown`, other EVM chains) returns `None`.
-fn chain_id(net: &Network) -> Option<u64> {
+///
+/// Public because settlement is the second consumer (ADR-0010's follow-up): a
+/// settler compares a claim's network against the chain its RPC provider is
+/// actually connected to, so the same one auditable table decides both which
+/// chains are verified and which are settled on.
+#[must_use]
+pub fn chain_id(net: &Network) -> Option<u64> {
     match net {
         Network::Base => Some(8453),
         Network::BaseSepolia => Some(84_532),
@@ -279,14 +317,20 @@ fn eip712_digest(
     keccak256(preimage)
 }
 
-/// Parses a `0x`-prefixed 65-byte signature, rejects high-`s` malleability, and
-/// recovers the signer address from `digest`.
+/// Splits a `0x`-prefixed 65-byte hex signature into the `(r, s, v)` ABI
+/// components an EIP-3009 `transferWithAuthorization` call takes as three
+/// separate arguments. `v` is normalised to 27/28 (the encoding that call
+/// expects), so a raw-parity `v` of 0/1 on the wire is accepted and lifted.
+///
+/// This is the crate's only signature parser: high-`s` malleability is rejected
+/// here, at parse time (ADR-0013), so no caller — verifier or settler — can
+/// obtain the components while skipping the check.
 ///
 /// # Errors
-/// - [`VerifyError::SignatureFormat`] if the string is not `0x` + 130 hex, the
-///   recovery id is out of range, or recovery itself fails.
+/// - [`VerifyError::SignatureFormat`] if the string is not `0x` + 130 hex or
+///   the recovery id is out of range.
 /// - [`VerifyError::SignatureMalleable`] if `s` is in the upper half-order.
-fn recover_signer(signature: &str, digest: &B256) -> Result<Address, VerifyError> {
+pub fn split_signature(signature: &str) -> Result<([u8; 32], [u8; 32], u8), VerifyError> {
     let hex = signature
         .strip_prefix("0x")
         .ok_or(VerifyError::SignatureFormat)?;
@@ -297,21 +341,39 @@ fn recover_signer(signature: &str, digest: &B256) -> Result<Address, VerifyError
     // decode of 130 hex chars yields exactly 65 bytes.
 
     // Accept v ∈ {27, 28} (EIP-155-free) and raw parity v ∈ {0, 1}.
-    let recid = match bytes[64] {
-        27 | 28 => bytes[64] - 27,
-        v @ (0 | 1) => v,
+    let v = match bytes[64] {
+        v @ (27 | 28) => v,
+        v @ (0 | 1) => v + 27,
         _ => return Err(VerifyError::SignatureFormat),
     };
 
     let r = B256::from_slice(&bytes[0..32]);
     let s = B256::from_slice(&bytes[32..64]);
-    let sig = Signature::from_scalars_and_parity(r, s, recid == 1);
+    let sig = Signature::from_scalars_and_parity(r, s, v == 28);
 
     // `normalize_s` returns `Some` only when `s` is high — that is the
     // malleable twin, which we reject outright (security-actionable per EIP-2).
     if sig.normalize_s().is_some() {
         return Err(VerifyError::SignatureMalleable);
     }
+
+    Ok((r.0, s.0, v))
+}
+
+/// Parses a `0x`-prefixed 65-byte signature and recovers the signer address
+/// from `digest`.
+///
+/// Delegates the parse — and with it the high-`s` rejection — to
+/// [`split_signature`], so the malleability gate lives in exactly one place.
+///
+/// # Errors
+/// - [`VerifyError::SignatureFormat`] if the string is not `0x` + 130 hex, the
+///   recovery id is out of range, or recovery itself fails.
+/// - [`VerifyError::SignatureMalleable`] if `s` is in the upper half-order.
+fn recover_signer(signature: &str, digest: &B256) -> Result<Address, VerifyError> {
+    let (r, s, v) = split_signature(signature)?;
+    // `split_signature` normalises v to 27/28, so the parity bit is v - 27.
+    let sig = Signature::from_scalars_and_parity(r.into(), s.into(), v - 27 == 1);
 
     sig.recover_address_from_prehash(digest)
         .map_err(|_| VerifyError::SignatureFormat)
@@ -331,6 +393,15 @@ mod tests {
     const NAME: &str = "USD Coin";
     const VERSION: &str = "2";
     const NOW: u64 = 1_000;
+    /// The `maxTimeoutSeconds` every fixture requirement advertises.
+    const MAX_TIMEOUT_SECS: u64 = 60;
+    /// The fixtures' `validBefore`, exactly at the edge of the advertised window:
+    /// live at `NOW`, and no longer-lived than the challenge promised. Both forms
+    /// are the same instant — the wire carries a decimal string, the digest a
+    /// number — and they must be kept in step by hand because `const` arithmetic
+    /// cannot produce a `&str`.
+    const VALID_BEFORE: &str = "1060";
+    const VALID_BEFORE_SECS: u64 = NOW + MAX_TIMEOUT_SECS;
 
     // A fixed private key (0x0101..01) makes every signature deterministic.
     fn signing_key() -> SigningKey {
@@ -355,7 +426,7 @@ mod tests {
             mime_type: String::new(),
             output_schema: None,
             pay_to: PAY_TO.parse().unwrap(),
-            max_timeout_seconds: 60,
+            max_timeout_seconds: MAX_TIMEOUT_SECS,
             asset: ASSET.parse().unwrap(),
             extra,
         }
@@ -423,7 +494,7 @@ mod tests {
     }
 
     fn valid_payload() -> PaymentPayload {
-        signed_payload("1000", "0", "9999999999", PAY_TO, signer_address(), |_| {})
+        signed_payload("1000", "0", VALID_BEFORE, PAY_TO, signer_address(), |_| {})
     }
 
     // ---- Oracle: hand-rolled digest == alloy-sol-types sol! implementation ----
@@ -445,7 +516,7 @@ mod tests {
         let to = addr_from(PAY_TO);
         let value = U256::from(1000u64);
         let valid_after = U256::from(0u64);
-        let valid_before = U256::from(9_999_999_999u64);
+        let valid_before = U256::from(VALID_BEFORE_SECS);
         let nonce = nonce_word(&NONCE.parse().unwrap());
 
         let ours = eip712_digest(
@@ -497,7 +568,7 @@ mod tests {
     fn tampered_signature_byte_is_signer_mismatch() {
         // Flip a byte inside r: still a well-formed low-s sig, but recovers a
         // different address.
-        let payload = signed_payload("1000", "0", "9999999999", PAY_TO, signer_address(), |raw| {
+        let payload = signed_payload("1000", "0", VALID_BEFORE, PAY_TO, signer_address(), |raw| {
             raw[0] ^= 0x01;
         });
         let reqs = requirements("1000", Network::Base, Some(default_extra()));
@@ -511,7 +582,7 @@ mod tests {
     fn from_not_matching_recovered_signer_is_mismatch() {
         // Sign with key A (the fixture key) but claim `from` = a different addr.
         let other = "0x4444444444444444444444444444444444444444";
-        let payload = signed_payload("1000", "0", "9999999999", PAY_TO, addr_from(other), |_| {});
+        let payload = signed_payload("1000", "0", VALID_BEFORE, PAY_TO, addr_from(other), |_| {});
         // signed_payload set `from` to `other`, but the signature is over key A.
         let reqs = requirements("1000", Network::Base, Some(default_extra()));
         assert_eq!(
@@ -528,7 +599,7 @@ mod tests {
             16,
         )
         .unwrap();
-        let payload = signed_payload("1000", "0", "9999999999", PAY_TO, signer_address(), |raw| {
+        let payload = signed_payload("1000", "0", VALID_BEFORE, PAY_TO, signer_address(), |raw| {
             // Replace s with its high-half twin (n - s); the recovery byte is
             // left in range so the malleability gate (not the format gate) fires.
             let s = U256::from_be_slice(&raw[32..64]);
@@ -544,7 +615,7 @@ mod tests {
 
     #[test]
     fn out_of_range_recovery_id_is_format_error() {
-        let payload = signed_payload("1000", "0", "9999999999", PAY_TO, signer_address(), |raw| {
+        let payload = signed_payload("1000", "0", VALID_BEFORE, PAY_TO, signer_address(), |raw| {
             raw[64] = 29;
         });
         let reqs = requirements("1000", Network::Base, Some(default_extra()));
@@ -568,7 +639,7 @@ mod tests {
     #[test]
     fn wrong_recipient_is_recipient_mismatch() {
         let other = "0x4444444444444444444444444444444444444444";
-        let payload = signed_payload("1000", "0", "9999999999", other, signer_address(), |_| {});
+        let payload = signed_payload("1000", "0", VALID_BEFORE, other, signer_address(), |_| {});
         let reqs = requirements("1000", Network::Base, Some(default_extra()));
         assert_eq!(
             verify_payment(&payload, &reqs, NOW),
@@ -591,7 +662,7 @@ mod tests {
         let payload = signed_payload(
             "1000",
             "5000",
-            "9999999999",
+            VALID_BEFORE,
             PAY_TO,
             signer_address(),
             |_| {},
@@ -612,6 +683,75 @@ mod tests {
             verify_payment(&payload, &reqs, NOW),
             Err(VerifyError::Expired)
         );
+    }
+
+    #[test]
+    fn a_validity_window_longer_than_the_advertised_timeout_is_rejected() {
+        let reqs = requirements("1000", Network::Base, Some(default_extra()));
+
+        // A week-long authorization: perfectly signable, and nothing in the
+        // signature says it is wrong. Accepting it would hand the operator a claim
+        // that stays redeemable for days after the challenge said it had to, which
+        // is what the settler's bounded log lookback must not have to survive.
+        let week = signed_payload(
+            "1000",
+            "0",
+            &(NOW + 7 * 24 * 60 * 60).to_string(),
+            PAY_TO,
+            signer_address(),
+            |_| {},
+        );
+        assert_eq!(
+            verify_payment(&week, &reqs, NOW),
+            Err(VerifyError::ValidityWindowTooLong)
+        );
+
+        // The boundary itself, both sides. The bound is the advertised window PLUS
+        // the clock-skew grace, so the last instant inside it is accepted and one
+        // second past it is refused — a payer signing exactly what was advertised
+        // (with a clock no more than the grace out of step) must never be turned away.
+        let inside = signed_payload(
+            "1000",
+            "0",
+            &(VALID_BEFORE_SECS + CLOCK_SKEW_GRACE_SECONDS).to_string(),
+            PAY_TO,
+            signer_address(),
+            |_| {},
+        );
+        assert_eq!(verify_payment(&inside, &reqs, NOW), Ok(()));
+
+        let over = signed_payload(
+            "1000",
+            "0",
+            &(VALID_BEFORE_SECS + CLOCK_SKEW_GRACE_SECONDS + 1).to_string(),
+            PAY_TO,
+            signer_address(),
+            |_| {},
+        );
+        assert_eq!(
+            verify_payment(&over, &reqs, NOW),
+            Err(VerifyError::ValidityWindowTooLong)
+        );
+        assert_eq!(verify_payment(&valid_payload(), &reqs, NOW), Ok(()));
+    }
+
+    #[test]
+    fn a_client_whose_clock_runs_slightly_fast_is_still_accepted() {
+        // The reference x402 client computes `validBefore = ITS OWN now +
+        // maxTimeoutSeconds`, and this bound is evaluated against OURS. A payer one
+        // second ahead of the server therefore signs a `validBefore` one second past
+        // the zero-tolerance edge — and would be refused permanently, since re-signing
+        // reproduces the same value. The grace is what keeps a correct client working.
+        let reqs = requirements("1000", Network::Base, Some(default_extra()));
+        let fast = signed_payload(
+            "1000",
+            "0",
+            &(VALID_BEFORE_SECS + 1).to_string(),
+            PAY_TO,
+            signer_address(),
+            |_| {},
+        );
+        assert_eq!(verify_payment(&fast, &reqs, NOW), Ok(()));
     }
 
     #[test]
@@ -668,6 +808,104 @@ mod tests {
         assert_eq!(
             verify_payment(&payload, &reqs, NOW),
             Err(VerifyError::DomainField { field: "name" })
+        );
+    }
+
+    // ---- split_signature (the ABI-component view of the same parse) ----
+
+    /// The `r`/`s`/`v` of `valid_payload`'s signature. The fixture key and the
+    /// digest are both fixed and signing is RFC-6979 deterministic, so these
+    /// literals pin the exact byte layout the settler will pass to
+    /// `transferWithAuthorization`.
+    const VALID_R: &str = "9dabe60994f4d4fdabbe93b2552a835710504dd1a4d4c74c18eca62028a4841f";
+    const VALID_S: &str = "580f101d23878ed88895939beead1410f4f99e17506ba5eaa009744ad0345ed5";
+
+    #[test]
+    fn split_signature_yields_the_abi_components() {
+        let payload = valid_payload();
+        let (r, s, v) = split_signature(&payload.payload.signature).unwrap();
+
+        assert_eq!(alloy_primitives::hex::encode(r), VALID_R);
+        assert_eq!(alloy_primitives::hex::encode(s), VALID_S);
+        assert!(v == 27 || v == 28, "v must be normalised to 27/28, got {v}");
+    }
+
+    #[test]
+    fn split_signature_rejects_the_high_s_twin() {
+        // secp256k1 curve order n.
+        let n = U256::from_str_radix(
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+            16,
+        )
+        .unwrap();
+        let payload = signed_payload("1000", "0", VALID_BEFORE, PAY_TO, signer_address(), |raw| {
+            let s = U256::from_be_slice(&raw[32..64]);
+            let high = n - s;
+            raw[32..64].copy_from_slice(&high.to_be_bytes::<32>());
+        });
+        assert_eq!(
+            split_signature(&payload.payload.signature).unwrap_err(),
+            VerifyError::SignatureMalleable
+        );
+    }
+
+    #[test]
+    fn split_components_reassemble_into_the_same_signer() {
+        let payload = valid_payload();
+        let digest = eip712_digest(
+            signer_address(),
+            addr_from(PAY_TO),
+            U256::from(1000u64),
+            U256::ZERO,
+            U256::from(VALID_BEFORE_SECS),
+            nonce_word(&NONCE.parse().unwrap()),
+            NAME,
+            VERSION,
+            8453,
+            addr_from(ASSET),
+        );
+
+        let (r, s, v) = split_signature(&payload.payload.signature).unwrap();
+        let mut raw = [0u8; 65];
+        raw[..32].copy_from_slice(&r);
+        raw[32..64].copy_from_slice(&s);
+        raw[64] = v;
+        let reassembled = format!("0x{}", alloy_primitives::hex::encode(raw));
+
+        assert_eq!(
+            recover_signer(&reassembled, &digest),
+            recover_signer(&payload.payload.signature, &digest)
+        );
+        assert_eq!(recover_signer(&reassembled, &digest), Ok(signer_address()));
+    }
+
+    #[test]
+    fn split_signature_rejects_malformed_input() {
+        let valid = valid_payload().payload.signature;
+
+        // Missing the `0x` prefix.
+        assert_eq!(
+            split_signature(valid.strip_prefix("0x").unwrap()).unwrap_err(),
+            VerifyError::SignatureFormat
+        );
+        // Wrong length (truncated).
+        assert_eq!(
+            split_signature(&valid[..40]).unwrap_err(),
+            VerifyError::SignatureFormat
+        );
+        // Right length, not hex.
+        let non_hex = format!("0x{}", "z".repeat(130));
+        assert_eq!(
+            split_signature(&non_hex).unwrap_err(),
+            VerifyError::SignatureFormat
+        );
+        // Recovery id outside {0, 1, 27, 28}.
+        let payload = signed_payload("1000", "0", VALID_BEFORE, PAY_TO, signer_address(), |raw| {
+            raw[64] = 29;
+        });
+        assert_eq!(
+            split_signature(&payload.payload.signature).unwrap_err(),
+            VerifyError::SignatureFormat
         );
     }
 

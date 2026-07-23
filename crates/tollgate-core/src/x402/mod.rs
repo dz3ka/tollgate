@@ -25,5 +25,9 @@ pub const SPEC_REVISION: &str = "coinbase/x402@dd927a26cfefc98c24b3ec38b3a8f204d
 /// Maximum accepted size, in bytes, of a raw `X-PAYMENT` header (`DoS` guard).
 pub const MAX_PAYMENT_HEADER_BYTES: usize = 8 * 1024;
 
+/// Slack allowed on the payer's clock when bounding an authorization's validity
+/// window (see [`verify_payment`](crate::x402::verify_payment)).
+pub const CLOCK_SKEW_GRACE_SECONDS: u64 = 300;
+
 /// Maximum decimal digits permitted in a `UintStr` (U256 max is 78 digits).
 pub const MAX_UINT_DIGITS: usize = 78; // U256 max is 78 decimal digits

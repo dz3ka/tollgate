@@ -8,7 +8,7 @@
 //!
 //! 1. GET with a valid signed `X-PAYMENT` → 200 with the upstream's body, so the
 //!    request really was gated, accepted, and proxied.
-//! 2. `unsettled(10)` against the same database → exactly that claim, signature
+//! 2. `settleable(0, 10)` against the same database → exactly that claim, signature
 //!    intact — the bytes a settlement worker will later replay on-chain.
 //!
 //! The other two tests cover the branches either side of that success path: a
@@ -29,7 +29,7 @@
 //! Podman socket), like the other testcontainers suites.
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_sol_types::{eip712_domain, sol, SolStruct};
@@ -66,8 +66,12 @@ const DOMAIN_VERSION: &str = "2";
 const AMOUNT: &str = "10000";
 /// Base Sepolia's EIP-712 chain id (see `verify::chain_id`).
 const CHAIN_ID: u64 = 84_532;
-/// A far-future `validBefore`: the gate verifies against real wall-clock time.
-const VALID_BEFORE: u64 = 9_999_999_999;
+/// The `maxTimeoutSeconds` the fixture challenge advertises — and therefore the
+/// longest validity window `verify_payment` will accept for a payment against it.
+const MAX_TIMEOUT_SECS: u64 = 3_600;
+/// The expiry cutoff passed to `settleable`: below every fixture's `validBefore`,
+/// so the read filters on settlement state alone — which is what these tests assert.
+const NO_CUTOFF: u64 = 0;
 /// The stub upstream's known response body — proves end-to-end relay.
 const UPSTREAM_BODY: &str = "hello from upstream";
 /// Postgres' port INSIDE the container; the module image publishes it on an
@@ -97,6 +101,10 @@ struct SignedPayment {
     payer: String,
     nonce: String,
     signature: String,
+    /// The deadline actually signed. Carried out of the builder because it is
+    /// derived from the clock — see [`build_payment`] — so a test asserting the
+    /// stored row cannot restate it as a constant.
+    valid_before: u64,
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -135,7 +143,10 @@ async fn accepted_payment_is_recorded_in_the_claims_ledger() {
     let ledger = PgClaimLedger::connect(&database_url)
         .await
         .expect("connect to the gateway's database");
-    let owed = ledger.unsettled(10).await.expect("read unsettled claims");
+    let owed = ledger
+        .settleable(NO_CUTOFF, 10)
+        .await
+        .expect("read settleable claims");
     assert_eq!(
         owed.len(),
         1,
@@ -149,7 +160,10 @@ async fn accepted_payment_is_recorded_in_the_claims_ledger() {
     );
     assert_eq!(claim.nonce.as_str(), payment.nonce);
     assert_eq!(claim.value.as_str(), AMOUNT);
-    assert_eq!(claim.valid_before.as_str(), VALID_BEFORE.to_string());
+    assert_eq!(
+        claim.valid_before.as_str(),
+        payment.valid_before.to_string()
+    );
     assert_eq!(
         claim.signature, payment.signature,
         "the signature must survive intact — it is what gets replayed on-chain"
@@ -215,7 +229,7 @@ async fn payment_is_refused_with_503_when_the_ledger_is_unreachable() {
 /// (`redis_url: None`) — exactly what a restart, or a second instance behind a load
 /// balancer, looks like. The same signed header is presented to each in turn. If
 /// the gate forwarded on a ledger conflict, the second gateway would serve the
-/// replay for free off one paid row, so `unsettled()` is asserted at BOTH steps: it
+/// replay for free off one paid row, so `settleable()` is asserted at BOTH steps: it
 /// stays at exactly one row, which is what separates "rejected as a replay" from
 /// "never recorded in the first place".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -245,7 +259,11 @@ async fn replayed_payment_is_rejected_by_a_second_gateway_sharing_the_ledger() {
         "body must be the upstream's, proving the request really was forwarded"
     );
     assert_eq!(
-        ledger.unsettled(10).await.expect("read unsettled").len(),
+        ledger
+            .settleable(NO_CUTOFF, 10)
+            .await
+            .expect("read settleable")
+            .len(),
         1,
         "the accepted payment must be owed exactly once"
     );
@@ -259,7 +277,11 @@ async fn replayed_payment_is_rejected_by_a_second_gateway_sharing_the_ledger() {
         "a payment already in the ledger is a replay and must NOT be served again"
     );
     assert_eq!(
-        ledger.unsettled(10).await.expect("read unsettled").len(),
+        ledger
+            .settleable(NO_CUTOFF, 10)
+            .await
+            .expect("read settleable")
+            .len(),
         1,
         "the replay must not add a second row either — one payment, one claim"
     );
@@ -298,7 +320,7 @@ async fn spawn_gateway(database_url: &str, upstream_addr: SocketAddr) -> SocketA
         ASSET.parse().expect("asset is valid hex"),
         AMOUNT.parse().expect("amount is decimal"),
         "http://localhost/",
-        60,
+        MAX_TIMEOUT_SECS,
     )
     .extra(serde_json::json!({ "name": DOMAIN_NAME, "version": DOMAIN_VERSION }))
     .build();
@@ -390,6 +412,12 @@ fn build_payment() -> SignedPayment {
     let value = U256::from_str_radix(AMOUNT, 10).expect("amount");
     let nonce_bytes = [0x22u8; 32];
     let nonce = B256::from(nonce_bytes);
+    // Derived from the real clock rather than a far-future constant: the gate now
+    // refuses an authorization that stays valid for longer than the challenge's
+    // `maxTimeoutSeconds` advertised, and a year-2286 deadline is precisely that.
+    // Read ONCE — signing it and writing it into the JSON from two different reads
+    // would produce a signature over a different deadline than the one sent.
+    let valid_before = now_unix() + MAX_TIMEOUT_SECS;
 
     let domain = eip712_domain! {
         name: DOMAIN_NAME,
@@ -402,7 +430,7 @@ fn build_payment() -> SignedPayment {
         to,
         value,
         validAfter: U256::ZERO,
-        validBefore: U256::from(VALID_BEFORE),
+        validBefore: U256::from(valid_before),
         nonce,
     };
     let digest = message.eip712_signing_hash(&domain);
@@ -429,7 +457,7 @@ fn build_payment() -> SignedPayment {
                 "to": to.to_string(),
                 "value": AMOUNT,
                 "validAfter": "0",
-                "validBefore": VALID_BEFORE.to_string(),
+                "validBefore": valid_before.to_string(),
                 "nonce": nonce_hex,
             }
         }
@@ -443,5 +471,15 @@ fn build_payment() -> SignedPayment {
         payer: from.to_string().to_ascii_lowercase(),
         nonce: nonce_hex.to_ascii_lowercase(),
         signature,
+        valid_before,
     }
+}
+
+/// Wall-clock unix seconds: the same clock the gate verifies the authorization
+/// against, so the fixture's deadline has to be expressed in it.
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the system clock is after the unix epoch")
+        .as_secs()
 }

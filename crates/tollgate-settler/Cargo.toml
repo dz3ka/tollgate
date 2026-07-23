@@ -1,0 +1,54 @@
+[package]
+name = "tollgate-settler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tollgate-core = { path = "../tollgate-core" }
+tollgate-ledger = { path = "../tollgate-ledger" }
+# The alloy meta-crate is the ONLY alloy dependency here: `sol!` is taken from its
+# re-export (`alloy::sol`) so the generated code binds to the same alloy-core the
+# provider uses. A second, direct `alloy-sol-types` dependency could resolve to a
+# different alloy-primitives and silently produce incompatible `Address`/`U256`.
+# `default-features = false` drops the default `reqwest` (native-TLS) transport;
+# `reqwest-rustls-tls` puts it back on rustls instead, because the RPC URL carries
+# an API key and must never travel in the clear — and rustls needs no OpenSSL.
+alloy = { version = "2", default-features = false, features = [
+    "std",
+    "provider-http",
+    "signer-local",
+    "sol-types",
+    "rpc-types",
+    "reqwest-rustls-tls",
+] }
+thiserror = "2"
+# `sync` is here for `watch`, the shutdown flag the sweep reads between claims: the
+# signal is watched by its own task, so the loop needs a handle it can both peek at
+# without blocking and `select!` on.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+# The hermetic sweep test drives the REAL `SettlementClient` against a local axum
+# JSON-RPC fake reached through the production `TOLLGATE_RPC_URL` seam, and the real
+# `PgClaimLedger` against a throwaway Postgres — so there is no chain-client trait,
+# no mock transport and no test-only constructor in the crate itself. `tokio/net` is
+# what lets the test bind that server's ephemeral port.
+[dev-dependencies]
+axum = "0.8"
+serde_json = "1"
+testcontainers = "0.24"
+testcontainers-modules = { version = "0.12", features = ["postgres"] }
+tokio = { version = "1", features = ["net"] }

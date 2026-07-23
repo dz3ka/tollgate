@@ -5,7 +5,9 @@
 //! below states one of those guarantees — that the schema applies and re-applies,
 //! that a claim survives the round trip byte-for-byte (including a uint256 that
 //! overflows BIGINT), that the primary key makes a duplicate a no-op, that the
-//! work queue is ordered NUMERICALLY, and that a dead backend fails closed.
+//! work queue holds only claims that are still owed AND still redeemable and is
+//! ordered NUMERICALLY, that settling a claim is idempotent, and that a dead
+//! backend fails closed.
 //!
 //! ## Container strategy: one per test (not shared)
 //! Same reasoning as `redis_nonce_store.rs`: `ContainerAsync`'s Drop hands cleanup
@@ -25,11 +27,16 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::postgres::Postgres;
 
-use tollgate_middleware::{Claim, PgClaimLedger};
+use tollgate_ledger::{Claim, PgClaimLedger};
 
 /// Postgres' port INSIDE the container; the module's image publishes it on an
 /// ephemeral host port, and its default database/user/password are all `postgres`.
 const PG_PORT: u16 = 5432;
+
+/// A `min_valid_before` below every fixture's `valid_before`, so `settleable`'s
+/// expiry filter admits every seeded row and a test observes only the dimension it
+/// is actually about.
+const NO_CUTOFF: u64 = 0;
 
 const PAYER: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const PAYEE: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -120,7 +127,7 @@ async fn migrate_creates_schema_and_is_rerunnable() {
 /// claim that cannot be redeemed. The 78-digit `value` is the widest a `UintStr`
 /// admits — the boundary where a numeric column would start losing digits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn record_then_unsettled_round_trips_every_field() {
+async fn record_then_settleable_round_trips_every_field() {
     let (_container, ledger) = start_migrated_ledger().await;
 
     let max_value = "9".repeat(78);
@@ -131,7 +138,10 @@ async fn record_then_unsettled_round_trips_every_field() {
 
     assert!(ledger.record(&original).await.expect("record the claim"));
 
-    let owed = ledger.unsettled(10).await.expect("read unsettled claims");
+    let owed = ledger
+        .settleable(NO_CUTOFF, 10)
+        .await
+        .expect("read settleable claims");
     assert_eq!(owed.len(), 1, "exactly the one recorded claim is owed");
     let read = &owed[0];
     assert_eq!(read.payer.as_str(), original.payer.as_str());
@@ -161,7 +171,10 @@ async fn valid_before_beyond_bigint_round_trips_exactly() {
         .await
         .expect("record a uint256 validBefore"));
 
-    let owed = ledger.unsettled(10).await.expect("read unsettled claims");
+    let owed = ledger
+        .settleable(NO_CUTOFF, 10)
+        .await
+        .expect("read settleable claims");
     assert_eq!(owed.len(), 1);
     assert_eq!(
         owed[0].valid_before.as_str(),
@@ -194,7 +207,10 @@ async fn duplicate_payer_nonce_records_once() {
         "a duplicate (payer, nonce) must be a no-op (Ok(false))"
     );
 
-    let owed = ledger.unsettled(10).await.expect("read unsettled claims");
+    let owed = ledger
+        .settleable(NO_CUTOFF, 10)
+        .await
+        .expect("read settleable claims");
     assert_eq!(owed.len(), 1, "the duplicate must not add a second row");
     assert_eq!(
         owed[0].valid_before.as_str(),
@@ -212,7 +228,7 @@ async fn duplicate_payer_nonce_records_once() {
 /// a bare `ORDER BY` — would hand the settler its work in the wrong order and let
 /// the soonest-expiring claim lapse.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unsettled_orders_numerically_not_lexicographically() {
+async fn settleable_orders_numerically_not_lexicographically() {
     let (_container, ledger) = start_migrated_ledger().await;
 
     // Recorded in an order that matches neither expectation, so the assertion can
@@ -224,7 +240,10 @@ async fn unsettled_orders_numerically_not_lexicographically() {
             .expect("seed a claim"));
     }
 
-    let owed = ledger.unsettled(10).await.expect("read unsettled claims");
+    let owed = ledger
+        .settleable(NO_CUTOFF, 10)
+        .await
+        .expect("read settleable claims");
     let order: Vec<&str> = owed.iter().map(|c| c.valid_before.as_str()).collect();
     assert_eq!(
         order,
@@ -234,7 +253,139 @@ async fn unsettled_orders_numerically_not_lexicographically() {
     );
 }
 
-/// Guarantee 6: an unreachable backend fails CLOSED.
+/// Guarantee 6: a claim whose authorization has EXPIRED is not settleable.
+///
+/// An EIP-3009 authorization past its `validBefore` reverts on-chain forever, so an
+/// expired row is not work — it is a permanent failure. Worse, it sorts FIRST under
+/// the soonest-expiring-first ordering, so without this filter a handful of expired
+/// claims would fill every batch and starve the live ones out. The boundary is
+/// strict (`>`): a claim expiring exactly AT the cutoff is already dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settleable_excludes_claims_that_have_expired() {
+    let (_container, ledger) = start_migrated_ledger().await;
+
+    for (suffix, valid_before) in [
+        ('1', "1699999999"),
+        ('2', "1700000000"),
+        ('3', "1700000001"),
+    ] {
+        assert!(ledger
+            .record(&claim(suffix, valid_before))
+            .await
+            .expect("seed a claim"));
+    }
+
+    let owed = ledger
+        .settleable(1_700_000_000, 10)
+        .await
+        .expect("read settleable claims");
+    let live: Vec<&str> = owed.iter().map(|c| c.valid_before.as_str()).collect();
+    assert_eq!(
+        live,
+        ["1700000001"],
+        "only a claim expiring strictly AFTER the cutoff is still redeemable"
+    );
+}
+
+/// Guarantee 7: the surviving claims are still ordered by NUMBER once the expiry
+/// filter is applied.
+///
+/// Guarantee 5 pins the ordering on small seeds; this one pins it on realistic
+/// unix timestamps above a real cutoff, where the lexicographic trap is the other
+/// way round: as text "2000000000" sorts BEFORE "999999999" (a `2` beats a `9` on
+/// the first character), so a bare `ORDER BY valid_before` — which binds to the
+/// `::TEXT` projection — would hand the settler the claim with 30 more years of life
+/// ahead of one expiring in weeks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settleable_orders_live_claims_numerically_under_a_real_cutoff() {
+    let (_container, ledger) = start_migrated_ledger().await;
+
+    for (suffix, valid_before) in [('1', "2000000000"), ('2', "999999999"), ('3', "1700000000")] {
+        assert!(ledger
+            .record(&claim(suffix, valid_before))
+            .await
+            .expect("seed a claim"));
+    }
+
+    let owed = ledger
+        .settleable(999_999_998, 10)
+        .await
+        .expect("read settleable claims");
+    let order: Vec<&str> = owed.iter().map(|c| c.valid_before.as_str()).collect();
+    assert_eq!(
+        order,
+        ["999999999", "1700000000", "2000000000"],
+        "live claims must come back soonest-expiring first by NUMBER \
+         (lexicographic order would be 1700000000, 2000000000, 999999999)"
+    );
+}
+
+/// Guarantee 8: settling a claim is idempotent — the FIRST call owns the row.
+///
+/// `mark_settled` reports whether THIS call performed the transition, and that
+/// boolean is the settler's only interlock: two workers (or one worker retrying
+/// after a lost response) may both reach a claim, and exactly one may be told it
+/// won. A second `true` would licence a second on-chain redemption attempt and
+/// would overwrite the timestamp that records when the money actually arrived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mark_settled_transitions_a_claim_exactly_once() {
+    let (_container, ledger) = start_migrated_ledger().await;
+
+    let owed = claim('1', "1700000000");
+    assert!(ledger.record(&owed).await.expect("record the claim"));
+
+    assert!(
+        ledger
+            .mark_settled(&owed.payer, &owed.nonce)
+            .await
+            .expect("first settle"),
+        "the first call must report that IT settled the claim"
+    );
+    assert!(
+        !ledger
+            .mark_settled(&owed.payer, &owed.nonce)
+            .await
+            .expect("repeated settle"),
+        "a repeated (or concurrent) call must be a no-op, not a second win"
+    );
+}
+
+/// Guarantee 9: a settled claim leaves the work queue.
+///
+/// `settled_at` is the whole status field, so this is the only observable proof
+/// that `mark_settled` wrote the column the `settleable` predicate reads. A claim
+/// that stayed in the queue after settlement would be redeemed again on the next
+/// batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_settled_claim_is_no_longer_settleable() {
+    let (_container, ledger) = start_migrated_ledger().await;
+
+    let settled = claim('1', "1700000000");
+    let still_owed = claim('2', "1700000000");
+    assert!(ledger.record(&settled).await.expect("record the claim"));
+    assert!(ledger
+        .record(&still_owed)
+        .await
+        .expect("record the second claim"));
+
+    assert!(ledger
+        .mark_settled(&settled.payer, &settled.nonce)
+        .await
+        .expect("settle the first claim"));
+
+    let owed = ledger
+        .settleable(NO_CUTOFF, 10)
+        .await
+        .expect("read settleable claims");
+    let nonces: Vec<&str> = owed.iter().map(|c| c.nonce.as_str()).collect();
+    assert_eq!(
+        nonces,
+        [still_owed.nonce.as_str()],
+        "a settled claim must drop out of the queue, and only that one"
+    );
+}
+
+/// Guarantee 10: an unreachable backend fails CLOSED.
 ///
 /// We connect to a live container, confirm a write lands, then STOP the container
 /// out from under the ledger — the faithful model of a production outage — and

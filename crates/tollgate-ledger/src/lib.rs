@@ -1,7 +1,9 @@
+#![forbid(unsafe_code)]
 //! The Postgres claims ledger: the durable record of every ACCEPTED payment.
 //!
-//! The nonce store (`store.rs`) answers "has this authorization been spent?" and
-//! then forgets — its Redis keys expire. This ledger answers the other half:
+//! The nonce store that `tollgate-middleware` owns answers "has this authorization
+//! been spent?" and then forgets — its Redis keys expire. This ledger answers the
+//! other half:
 //! "what do we still have to collect?". A claim recorded here is money owed to the
 //! operator until a settlement worker redeems it on-chain (M5b), so the rows carry
 //! the complete, verbatim EIP-3009 authorization plus its signature.
@@ -174,7 +176,7 @@ impl PgClaimLedger {
     /// "harmless, carry on": this row outlives whatever the nonce store remembers
     /// (its keys expire, an in-memory store dies with the process), so a conflict
     /// here means the authorization was already spent even when the nonce store
-    /// swears it is fresh. The gate rejects on it (`gate.rs`).
+    /// swears it is fresh. `tollgate-middleware`'s payment gate rejects on it.
     ///
     /// # Errors
     /// Returns [`ClaimLedgerError::Backend`] if the statement cannot be executed.
@@ -205,31 +207,80 @@ impl PgClaimLedger {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Reads unsettled (owed) claims, soonest-expiring first. `limit` bounds the
-    /// read so a caller can never pull an unbounded result set into memory.
+    /// Reads claims that are still owed AND still redeemable on-chain, soonest-
+    /// expiring first. `limit` bounds the read so a caller can never pull an
+    /// unbounded result set into memory.
+    ///
+    /// `min_valid_before` is a unix timestamp (in practice the settler's `now`):
+    /// rows expiring at or before it are excluded. An expired EIP-3009
+    /// authorization reverts on-chain forever, so it is not work — and because it
+    /// sorts FIRST under the soonest-expiring-first ordering, leaving it in would
+    /// let a backlog of dead claims starve every live one out of the batch.
     ///
     /// # Errors
     /// Returns [`ClaimLedgerError::Backend`] if the query fails or a row does not
     /// convert back into the validated core newtypes.
-    pub async fn unsettled(&self, limit: u32) -> Result<Vec<Claim>, ClaimLedgerError> {
+    pub async fn settleable(
+        &self,
+        min_valid_before: u64,
+        limit: u32,
+    ) -> Result<Vec<Claim>, ClaimLedgerError> {
         // `valid_before::TEXT` is the read-back half of the TEXT/NUMERIC trick in
         // `record`. The ORDER BY must be QUALIFIED (`claims.valid_before`): a bare
         // name matching an output column resolves to that output column, which here
         // is the TEXT projection — and text ordering puts "10" before "9", settling
         // claims in the wrong order. The qualified name binds to the NUMERIC column.
+        // (A WHERE clause never sees output names, but it is qualified to match.)
         // `payer, nonce` break ties so the order is total and the read deterministic.
         let rows = sqlx::query(
             "SELECT payer, nonce, payee, signature, value, valid_after, \
              valid_before::TEXT AS valid_before, asset, network \
-             FROM claims WHERE settled_at IS NULL \
-             ORDER BY claims.valid_before ASC, payer, nonce LIMIT $1",
+             FROM claims WHERE settled_at IS NULL AND claims.valid_before > $1 \
+             ORDER BY claims.valid_before ASC, payer, nonce LIMIT $2",
         )
-        // Postgres has no unsigned integers; every u32 widens into an i64 losslessly.
+        // Postgres has no unsigned integers. A cutoff past `i64::MAX` seconds is not
+        // a clock reading any machine can produce, but it must not panic or wrap
+        // into a NEGATIVE cutoff that would admit every expired claim — so it
+        // saturates, which errs towards handing out no work at all.
+        .bind(i64::try_from(min_valid_before).unwrap_or(i64::MAX))
+        // Every u32 widens into an i64 losslessly.
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await?;
 
         rows.iter().map(claim_from_row).collect()
+    }
+
+    /// Marks a claim settled. `Ok(true)` = THIS call transitioned the row from owed
+    /// to settled; `Ok(false)` = it was already settled (or no such row).
+    ///
+    /// The `settled_at IS NULL` guard is what makes that boolean worth anything: it
+    /// is the settler's interlock, so a concurrent second worker — or the same
+    /// worker retrying after a lost response — is a no-op rather than a second
+    /// winner, and can never overwrite the timestamp of the original settlement.
+    ///
+    /// There is deliberately no transaction hash parameter and no column for one.
+    /// EIP-3009 emits `AuthorizationUsed(authorizer indexed, nonce indexed)`, keyed
+    /// on exactly this table's primary key, so the on-chain record is recoverable
+    /// from the row itself; the settler logs the hash beside the nonce.
+    ///
+    /// # Errors
+    /// Returns [`ClaimLedgerError::Backend`] if the statement cannot be executed.
+    pub async fn mark_settled(
+        &self,
+        payer: &EvmAddress,
+        nonce: &Nonce,
+    ) -> Result<bool, ClaimLedgerError> {
+        let result = sqlx::query(
+            "UPDATE claims SET settled_at = now() \
+             WHERE payer = $1 AND nonce = $2 AND settled_at IS NULL",
+        )
+        .bind(payer.as_str())
+        .bind(nonce.as_str())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
     }
 }
 

@@ -14,8 +14,8 @@ use tollgate_core::x402::{
     decode_payment_header, verify_payment, Challenge, PaymentDecodeError, PaymentRequirements,
     VerifyError,
 };
+use tollgate_ledger::{Claim, PgClaimLedger};
 
-use crate::ledger::{Claim, PgClaimLedger};
 use crate::store::{NonceBackend, NonceStore as _};
 
 /// Immutable per-gate configuration: the payment requirements every request is
@@ -322,6 +322,9 @@ fn verify_reason(e: &VerifyError) -> &'static str {
     match e {
         VerifyError::Expired => "payment authorization expired",
         VerifyError::NotYetValid => "payment authorization not yet valid",
+        // Actionable, and it leaks nothing: `maxTimeoutSeconds` is advertised in
+        // the challenge the client just read, so the fix is to re-sign inside it.
+        VerifyError::ValidityWindowTooLong => "payment authorization is valid for too long",
         VerifyError::InsufficientValue => "payment amount is insufficient",
         VerifyError::RecipientMismatch => "payment recipient does not match",
         VerifyError::NetworkMismatch => "payment network does not match",

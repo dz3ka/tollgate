@@ -11,6 +11,9 @@ workspace = true
 
 [dependencies]
 tollgate-core = { path = "../tollgate-core" }
+# The claims ledger lives in its own crate so the settlement worker can read claims
+# without linking axum/tower/redis; the gate keeps re-exporting its public types.
+tollgate-ledger = { path = "../tollgate-ledger" }
 axum = "0.8"
 tower = "0.5"
 http = "1"
@@ -18,16 +21,6 @@ serde_json = "1"
 # Redis-backed nonce store (M4). `tokio-comp` pulls in the tokio-based async
 # runtime glue for the multiplexed connection; no connection-pool feature needed.
 redis = { version = "0.27", features = ["tokio-comp"] }
-# Postgres claims ledger (M5a). `runtime-tokio` picks the async runtime glue;
-# `migrate` + `macros` power the compile-time-embedded `sqlx::migrate!()` (the SQL
-# is baked into the binary, so no database is needed to BUILD). Deliberately no
-# `tls-*` feature: M5a speaks plain Postgres, matching the http-only upstream rule.
-sqlx = { version = "0.8", default-features = false, features = [
-    "runtime-tokio",
-    "postgres",
-    "migrate",
-    "macros",
-] }
 thiserror = "2"
 # Structured logging for the fail-closed store-outage path (ADR-0020): the `Err`
 # arm of the nonce claim emits `tracing::error!` before returning 503. No metrics.
@@ -43,4 +36,4 @@ tower = { version = "0.5", features = ["util"] }
 # gives the runner/`ImageExt`/`ContainerAsync` API; the `redis` feature of
 # `-modules` provides the ready-made `Redis` image with its readiness wait.
 testcontainers = "0.24"
-testcontainers-modules = { version = "0.12", features = ["postgres", "redis"] }
+testcontainers-modules = { version = "0.12", features = ["redis"] }

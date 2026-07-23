@@ -19,9 +19,12 @@
 //! [`PaymentRequirements`]: tollgate_core::x402::PaymentRequirements
 
 mod gate;
-mod ledger;
 mod store;
 
 pub use gate::{GateConfig, PaymentGate, PaymentLayer};
-pub use ledger::{Claim, ClaimLedgerError, PgClaimLedger};
 pub use store::{InMemoryNonceStore, NonceBackend, NonceStore, NonceStoreError, RedisNonceStore};
+// The ledger itself lives in `tollgate-ledger` (a settlement worker must read
+// claims without linking axum/tower/redis). It is re-exported here so the gate's
+// public surface — `GateConfig { ledger, .. }` and everything a caller needs to
+// build one — stays reachable from this crate alone.
+pub use tollgate_ledger::{Claim, ClaimLedgerError, PgClaimLedger};

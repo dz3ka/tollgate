@@ -10,10 +10,18 @@
 //! instead — the client is told what to pay and (when useful) why the last
 //! attempt was rejected.
 //!
+//! The crate also carries the [`PgClaimLedger`] — the durable record of every
+//! accepted claim, i.e. the money owed to the operator until a settlement worker
+//! redeems it on-chain. When a [`GateConfig`] carries one, the gate records the
+//! claim on the accept path — after the nonce is claimed, before the request is
+//! forwarded — and fails closed if that write does not land.
+//!
 //! [`PaymentRequirements`]: tollgate_core::x402::PaymentRequirements
 
 mod gate;
+mod ledger;
 mod store;
 
 pub use gate::{GateConfig, PaymentGate, PaymentLayer};
+pub use ledger::{Claim, ClaimLedgerError, PgClaimLedger};
 pub use store::{InMemoryNonceStore, NonceBackend, NonceStore, NonceStoreError, RedisNonceStore};

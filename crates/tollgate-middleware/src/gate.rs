@@ -11,14 +11,16 @@ use axum::response::Response;
 use http::StatusCode;
 
 use tollgate_core::x402::{
-    decode_payment_header, verify_payment, Challenge, EvmAddress, Nonce, PaymentDecodeError,
-    PaymentRequirements, VerifyError,
+    decode_payment_header, verify_payment, Challenge, PaymentDecodeError, PaymentRequirements,
+    VerifyError,
 };
 
+use crate::ledger::{Claim, PgClaimLedger};
 use crate::store::{NonceBackend, NonceStore as _};
 
 /// Immutable per-gate configuration: the payment requirements every request is
-/// verified against, plus the replay store. Built once at startup, shared via Arc.
+/// verified against, the replay store, and the optional claims ledger. Built once
+/// at startup, shared via Arc.
 pub struct GateConfig {
     /// The single offer every request is verified against and that is echoed in
     /// every 402 challenge.
@@ -27,6 +29,10 @@ pub struct GateConfig {
     /// backend selection (in-memory or Redis); it is `Clone` and every clone of the
     /// gate shares the same underlying store (Arc / multiplexed connection).
     pub store: NonceBackend,
+    /// Where accepted claims are recorded so they can be settled later. `None`
+    /// means no ledger is configured and accepted payments are NOT persisted —
+    /// the gate still works, the operator simply collects nothing.
+    pub ledger: Option<PgClaimLedger>,
 }
 
 /// A [`tower::Layer`] that wraps an inner service in a [`PaymentGate`].
@@ -149,8 +155,13 @@ where
             // is now fallible (Redis I/O), so we match all three outcomes
             // EXHAUSTIVELY — the compiler forbids a catch-all `_ => forward` arm, so
             // a future backend variant cannot silently fall through to accept.
-            let auth = &payload.payload.authorization;
-            let key = replay_key(&auth.from, &auth.nonce);
+            //
+            // The claim is built FIRST, before either the replay key or the store
+            // call: it owns the canonical (lowercased) payer/nonce pair, so deriving
+            // the key from it keeps the replay identity and the ledger's primary key
+            // literally the same two strings — they cannot drift apart.
+            let claim = Claim::from_payment(&payload, &config.requirements);
+            let key = replay_key(&claim);
             // Per-claim TTL from the authorization's OWN validity window: a nonce
             // must be remembered exactly as long as its authorization could still be
             // validly presented, i.e. until `validBefore`. A fixed store-wide TTL
@@ -163,15 +174,62 @@ where
             // admit a replay; only under-remembering can. `verify_payment` already
             // proved `now < validBefore`, so `vb - now >= 1` and the TTL is never
             // zero (a zero PX would be rejected by Redis and drop replay protection).
-            let vb = auth
+            let vb = claim
                 .valid_before
                 .as_str()
                 .parse::<u64>()
                 .unwrap_or(u64::MAX);
             let ttl = std::time::Duration::from_secs(vb.saturating_sub(now));
             match config.store.claim(&key, ttl).await {
-                // Fresh nonce: paid, verified, first sighting -> forward to inner.
-                Ok(true) => inner.call(req).await,
+                // Fresh nonce: paid, verified, first sighting. Record what we are
+                // owed, THEN forward. The order is load-bearing in both directions:
+                // recording before the nonce claim would persist replays, and
+                // recording after the response would mean a request could be served
+                // and paid for with no durable record of the money owed.
+                Ok(true) => {
+                    // Only the nonce is ever logged as the claim's correlator: the
+                    // payer address, the replay key and the signature are all off
+                    // limits (ADR-0020), which is also why `Claim` is not `Debug`.
+                    if let Some(ledger) = &config.ledger {
+                        match ledger.record(&claim).await {
+                            Ok(true) => {
+                                tracing::info!(nonce = claim.nonce.as_str(), "claim recorded");
+                            }
+                            // The nonce store said "fresh" and the ledger said
+                            // "already there": the two stores disagree, and only one
+                            // of them can be right. The nonce store is the one that
+                            // FORGETS — an in-memory store across a restart, an
+                            // expired or flushed Redis key — while the row is
+                            // forever, so the ledger is authoritative on replay.
+                            // Reject with the nonce store's own replay answer, byte
+                            // for byte: a client must not learn which store caught it.
+                            Ok(false) => {
+                                tracing::warn!(
+                                    nonce = claim.nonce.as_str(),
+                                    "claim already in ledger; replay store and ledger diverged"
+                                );
+                                return Ok(challenge_402(
+                                    &config.requirements,
+                                    Some("payment nonce already used"),
+                                ));
+                            }
+                            // Fail CLOSED, exactly like the nonce store: a payment we
+                            // cannot record is money we cannot collect, so we must not
+                            // serve the request. Same fixed 503 body as a nonce-store
+                            // outage, deliberately — a client must not be able to tell
+                            // which backend is down.
+                            Err(e) => {
+                                tracing::error!(
+                                    error = %e,
+                                    nonce = claim.nonce.as_str(),
+                                    "claim ledger record failed"
+                                );
+                                return Ok(store_unavailable_503());
+                            }
+                        }
+                    }
+                    inner.call(req).await
+                }
                 // Already claimed: this authorization was spent -> replay, reject 402.
                 Ok(false) => Ok(challenge_402(
                     &config.requirements,
@@ -199,15 +257,13 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Canonical replay identity. EIP-3009 nonces are per-authorizer; address casing is
-/// non-semantic -> lowercase both and join. `from` and `nonce` are `EvmAddress`/`Nonce`
-/// (both expose `.as_str()`).
-fn replay_key(from: &EvmAddress, nonce: &Nonce) -> String {
-    format!(
-        "{}:{}",
-        from.as_str().to_ascii_lowercase(),
-        nonce.as_str().to_ascii_lowercase()
-    )
+/// Canonical replay identity: the claim's `(payer, nonce)` pair joined by a colon.
+/// EIP-3009 nonces are per-authorizer and address casing is non-semantic, so the
+/// key must be lowercased — but it is lowercased in `Claim::from_payment` and
+/// NOWHERE ELSE, so the replay key and the ledger's primary key are the same
+/// canonical strings by construction rather than by two agreeing conventions.
+fn replay_key(claim: &Claim) -> String {
+    format!("{}:{}", claim.payer.as_str(), claim.nonce.as_str())
 }
 
 /// 402 + serialized `Challenge` JSON. `Content-Type: application/json`. NO `WWW-Authenticate`.
@@ -289,7 +345,7 @@ mod tests {
     use super::*;
 
     use crate::store::InMemoryNonceStore;
-    use tollgate_core::x402::{Network, PaymentRequirementsBuilder};
+    use tollgate_core::x402::{Network, PaymentPayload, PaymentRequirementsBuilder};
     use tower::{service_fn, Layer as _, ServiceExt as _};
 
     // Valid newtype fixtures: 40-hex address, 64-hex nonce.
@@ -312,6 +368,10 @@ mod tests {
         GateConfig {
             requirements: requirements(),
             store: NonceBackend::InMemory(InMemoryNonceStore::new()),
+            // No ledger: these tests are about the gate's 402 contract. The ledger
+            // path needs a real Postgres and is covered end to end in
+            // `tollgate-gateway/tests/ledger_e2e.rs`.
+            ledger: None,
         }
     }
 
@@ -377,14 +437,29 @@ mod tests {
 
     #[test]
     fn replay_key_lowercases_and_joins() {
-        let from: EvmAddress = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-            .parse()
-            .unwrap();
-        let nonce: Nonce = "0xABCDEF0000000000000000000000000000000000000000000000000000000000"
-            .parse()
-            .unwrap();
+        // Built from a MIXED-CASE authorization, the way the gate builds it: the key
+        // must come out fully lowercased even though nothing in `replay_key` itself
+        // lowercases anything any more.
+        let payload: PaymentPayload = serde_json::from_value(serde_json::json!({
+            "x402Version": 1,
+            "scheme": "exact",
+            "network": "base",
+            "payload": {
+                "signature": "0xdeadbeef",
+                "authorization": {
+                    "from": "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    "to": PAY_TO,
+                    "value": "10000",
+                    "validAfter": "0",
+                    "validBefore": "9999999999",
+                    "nonce": "0xABCDEF0000000000000000000000000000000000000000000000000000000000",
+                },
+            },
+        }))
+        .unwrap();
+        let claim = Claim::from_payment(&payload, &requirements());
         assert_eq!(
-            replay_key(&from, &nonce),
+            replay_key(&claim),
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0xabcdef0000000000000000000000000000000000000000000000000000000000"
         );
     }

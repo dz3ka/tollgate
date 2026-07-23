@@ -106,6 +106,9 @@ async fn gateway_gates_then_proxies_then_blocks_replay() {
         requirements,
         // No Redis URL: exercise the in-memory replay store, identical to M3.
         redis_url: None,
+        // No claims ledger either: this test is the proxy/replay path, and the
+        // ledger has its own e2e in `ledger_e2e.rs`.
+        database_url: None,
     };
     // `run` returns a non-`Send` boxed error, so we consume the result inside
     // the spawned task rather than letting it cross the spawn boundary.

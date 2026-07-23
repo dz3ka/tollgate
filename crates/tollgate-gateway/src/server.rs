@@ -4,7 +4,7 @@ use axum::Router;
 use tower_http::trace::TraceLayer;
 
 use tollgate_middleware::{
-    GateConfig, InMemoryNonceStore, NonceBackend, PaymentLayer, RedisNonceStore,
+    GateConfig, InMemoryNonceStore, NonceBackend, PaymentLayer, PgClaimLedger, RedisNonceStore,
 };
 
 use crate::config::GatewayConfig;
@@ -18,18 +18,26 @@ use crate::proxy::{proxy, ProxyCtx};
 ///
 /// The replay-store backend is selected here from `cfg.redis_url`: `Some(url)`
 /// picks Redis and connects to it EAGERLY (a dead Redis fails startup rather
-/// than every request), `None` keeps the in-process store.
+/// than every request), `None` keeps the in-process store. The claims ledger is
+/// selected the same way from `cfg.database_url`, and is additionally MIGRATED at
+/// startup so the first paid request never races the schema.
 ///
 /// # Errors
-/// Returns an error if the listen socket cannot be bound, the initial Redis
-/// connection cannot be established, or the server loop terminates abnormally.
+/// Returns an error if the listen socket cannot be bound, the initial Redis or
+/// Postgres connection cannot be established, a claims-ledger migration fails, or
+/// the server loop terminates abnormally.
 pub async fn run(cfg: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
-    // A non-sensitive label for the active backend, safe to log. The Redis URL
-    // itself may carry a password, so it is NEVER logged — only this label is.
+    // Non-sensitive labels for the active backends, safe to log. Both URLs may
+    // carry a password, so they are NEVER logged — only these labels are.
     let backend_name = if cfg.redis_url.is_some() {
         "redis"
     } else {
         "in-memory"
+    };
+    let ledger_name = if cfg.database_url.is_some() {
+        "postgres"
+    } else {
+        "none"
     };
 
     let store = match &cfg.redis_url {
@@ -43,9 +51,27 @@ pub async fn run(cfg: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
         None => NonceBackend::InMemory(InMemoryNonceStore::new()),
     };
 
+    // Eager connect AND migrate: a database that is down, unreachable, or on an
+    // incompatible schema fails startup (via `?`) instead of failing closed on every
+    // paid request afterwards. Running without a ledger is a supported mode
+    // (local/dev), but accepted payments are then unrecoverable — worth a warning
+    // line every boot.
+    let ledger = if let Some(url) = &cfg.database_url {
+        let ledger = PgClaimLedger::connect(url).await?;
+        ledger.migrate().await?;
+        Some(ledger)
+    } else {
+        tracing::warn!(
+            "no claims ledger configured; accepted payments will NOT be recorded \
+             and cannot be settled later"
+        );
+        None
+    };
+
     let gate_config = GateConfig {
         requirements: cfg.requirements,
         store,
+        ledger,
     };
 
     let ctx = ProxyCtx::new(cfg.upstream.clone(), cfg.upstream_timeout);
@@ -61,6 +87,7 @@ pub async fn run(cfg: GatewayConfig) -> Result<(), Box<dyn std::error::Error>> {
         listen = %cfg.listen,
         upstream = %cfg.upstream,
         backend = %backend_name,
+        ledger = %ledger_name,
         "tollgate-gateway listening"
     );
 

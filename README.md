@@ -22,9 +22,14 @@ full 402 → sign EIP-3009 → 200-relayed → replay-402 path over real TCP. Th
 **M4 nonce-store slice** is now in: a `NonceStore` trait with a Redis backend
 (atomic `SET NX PX` claim, per-claim TTL from each authorization's `validBefore`,
 store-error → fail-closed non-leaking 503), operator-selected via
-`TOLLGATE_REDIS_URL` and proven under concurrency by testcontainers. The M4 policy
-engine and milestones **M5–M7** (claims ledger + settlement, demo kit, and
-benchmarks) are planned — see the [Roadmap](#roadmap).
+`TOLLGATE_REDIS_URL` and proven under concurrency by testcontainers. The
+**M5a claims-ledger slice** follows the same shape: set `TOLLGATE_DATABASE_URL` to
+a Postgres URL and every accepted payment is recorded durably (schema migrated at
+startup, ledger-error → the same fail-closed 503) so a settlement worker can redeem
+it later; leave it **unset and claims are not recorded at all** — the gate still
+gates, but accepted payments leave nothing to settle from. The M4 policy engine,
+M5 settlement, and milestones **M6–M7** (demo kit and benchmarks) are planned — see
+the [Roadmap](#roadmap).
 
 ## Highlights
 
@@ -102,7 +107,7 @@ Milestone titles from PRD §8. Each milestone is one `/ship` cycle.
 | **M2** ✅ | Signature verification (EIP-712/EIP-3009 via alloy) |
 | **M3** ✅ | Tower middleware + axum gateway (happy path, in-memory nonce) |
 | **M4** ◐ | Redis nonce store ✅ (atomic `SET NX PX`, per-claim TTL, fail-closed 503); policy engine deferred |
-| **M5** ⬜ | Claims ledger + settlement batching on testnet |
+| **M5** ◐ | Postgres claims ledger ✅ (every accepted payment recorded, `TOLLGATE_DATABASE_URL`); settlement batching on testnet planned |
 | **M6** ⬜ | Demo kit: paying agent + gated MCP-style tool server |
 | **M7** ⬜ | Benchmarks, fuzzing, load test, performance writeup |
 

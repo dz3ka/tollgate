@@ -34,3 +34,8 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 alloy-primitives = { version = "1", default-features = false, features = ["std", "k256"] }
 alloy-sol-types = { version = "1", default-features = false, features = ["std"] }
 base64 = "0.22"
+# M5a ledger e2e: a throwaway Postgres behind the real gateway. `testcontainers`
+# gives the runner/`ContainerAsync` API; the `postgres` feature of `-modules`
+# provides the ready-made image with its readiness wait.
+testcontainers = "0.24"
+testcontainers-modules = { version = "0.12", features = ["postgres"] }

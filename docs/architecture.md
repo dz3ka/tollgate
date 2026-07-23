@@ -8,9 +8,11 @@ marked *present* exist today. As of **M3**, `tollgate-core`,
 `tollgate-middleware`, and `tollgate-gateway` are built (offline verification, the
 tower gate, and the axum reverse proxy); the **M4 nonce-store slice** then made
 **Redis** a real backend — the gate claims nonces atomically against Redis for
-replay protection. The rest of M4 (the policy engine: per-payer velocity and
-spend caps) and everything downstream remain planned containers that later
-milestones (M4–M7) will fill in.
+replay protection — and the **M5a claims-ledger slice** made **Postgres** one too:
+every accepted payment is recorded durably in the claims ledger. The rest of M4
+(the policy engine: per-payer velocity and spend caps), settlement (M5b), and
+everything downstream remain planned containers that later milestones (M4–M7)
+will fill in.
 
 The diagrams below render natively on GitHub via `mermaid` code fences — no build
 step required.
@@ -22,9 +24,10 @@ on. Two human/agent actors drive it: an **API provider (merchant)** wraps their
 endpoints and receives settlements, and an **Agent developer** whose agent pays
 per request. Tollgate itself is a single system boundary here; it settles on
 **Base Sepolia**, claims replay-protection state from **Redis**, and persists the
-claims ledger in **Postgres**. As of M4 the **Redis nonce-claim** integration is
-wired (the gate claims nonces atomically); velocity windows, Postgres, and Base
-Sepolia settlement remain the shape the later milestones build toward.
+claims ledger in **Postgres**. The **Redis nonce-claim** (M4) and **Postgres
+claims-ledger** (M5a) integrations are wired — the gate claims nonces atomically
+and records every accepted claim; velocity windows, the outbox, and Base Sepolia
+settlement remain the shape the later milestones build toward.
 
 ```mermaid
 C4Context
@@ -37,12 +40,12 @@ C4Context
 
     System_Ext(baseSepolia, "Base Sepolia", "EVM testnet: USDC settlement and batch redemption.")
     System_Ext(redis, "Redis", "Nonce acceptance [present, M4]; velocity windows [planned].")
-    System_Ext(postgres, "Postgres", "Claims ledger and transactional outbox.")
+    System_Ext(postgres, "Postgres", "Claims ledger [present, M5a]; transactional outbox [planned].")
 
     Rel(agentDev, tollgate, "Requests gated resources, submits signed payments", "HTTP / X-PAYMENT")
     Rel(merchant, tollgate, "Configures routes/prices, reads claims & settlement status", "HTTP / config")
     Rel(tollgate, redis, "Atomic nonce claim [present, M4]; velocity checks [planned]")
-    Rel(tollgate, postgres, "Records verified claims, outbox events")
+    Rel(tollgate, postgres, "Records verified claims [present, M5a]; outbox events [planned]")
     Rel(tollgate, baseSepolia, "Batches and redeems USDC claims", "JSON-RPC")
 ```
 
@@ -57,20 +60,20 @@ present/planned marker, and the legend restates the convention.
 
 ```mermaid
 C4Container
-    title Container view — Tollgate workspace (M3–M4 present vs. planned)
+    title Container view — Tollgate workspace (M3–M5a present vs. planned)
 
     Person(agentDev, "Agent developer")
     Person(merchant, "API provider (merchant)")
 
     System_Ext(baseSepolia, "Base Sepolia")
     System_Ext(redis, "Redis [present, M4 nonce]")
-    System_Ext(postgres, "Postgres")
+    System_Ext(postgres, "Postgres [present, M5a ledger]")
 
     System_Boundary(tollgate, "Tollgate") {
         Container(core, "tollgate-core", "Rust lib [present]", "x402 types, spec constants, payload parsing & verification.")
         Container(gateway, "tollgate-gateway", "Rust bin (axum) [present]", "Reverse proxy: gates upstreams, issues 402 challenges.")
         Container(middleware, "tollgate-middleware", "Rust lib [present]", "tower Layer/Service to embed the gate in a host app.")
-        Container(settler, "tollgate-settler", "Rust bin [planned M5]", "Settlement worker: batches claims, redeems on-chain.")
+        Container(settler, "tollgate-settler", "Rust bin [planned M5b]", "Settlement worker: batches claims, redeems on-chain.")
         Container(admin, "tollgate-admin", "Rust bin [planned]", "Admin API: claims, batches, per-agent spend, metrics.")
         Container(xtask, "xtask", "Rust bin [planned]", "In-workspace dev automation / tooling.")
     }
@@ -81,14 +84,15 @@ C4Container
     Rel(middleware, core, "Uses types & verification")
     Rel(settler, core, "Uses claim types")
     Rel(gateway, redis, "Atomic nonce claim [present, M4]; velocity [planned]")
-    Rel(gateway, postgres, "Records verified claims")
+    Rel(gateway, postgres, "Records verified claims [present, M5a]")
     Rel(settler, postgres, "Reads claims, writes settlement state")
     Rel(settler, baseSepolia, "Batch redemption", "JSON-RPC")
 
     UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
 ```
 
-**Legend.** `[present]` = shipped (M0–M3, plus the M4 Redis nonce-claim slice).
+**Legend.** `[present]` = shipped (M0–M3, plus the M4 Redis nonce-claim and M5a
+claims-ledger slices).
 `[planned M<n>]` = scheduled for that
 milestone (see the [Roadmap](../README.md#roadmap)); `[planned]` with no number is
 scheduled but unscoped. Planned containers are placeholders — their internals are

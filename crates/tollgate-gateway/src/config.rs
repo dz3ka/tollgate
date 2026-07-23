@@ -1,8 +1,9 @@
 //! Operator configuration for the gateway, sourced from the environment.
 //!
-//! Four knobs are read from the environment (`TOLLGATE_LISTEN`,
-//! `TOLLGATE_UPSTREAM`, `TOLLGATE_PAY_TO`, and the optional store selector
-//! `TOLLGATE_REDIS_URL`); everything else is a sensible Base Sepolia testnet
+//! Five knobs are read from the environment (`TOLLGATE_LISTEN`,
+//! `TOLLGATE_UPSTREAM`, `TOLLGATE_PAY_TO`, the optional store selector
+//! `TOLLGATE_REDIS_URL`, and the optional claims-ledger selector
+//! `TOLLGATE_DATABASE_URL`); everything else is a sensible Base Sepolia testnet
 //! default folded into the [`PaymentRequirements`] every request is verified
 //! against. Only env keys a code path actually reads are honoured — no
 //! speculative configuration surface.
@@ -61,6 +62,11 @@ pub struct GatewayConfig {
     /// exactly as long as its authorization could still be validly presented —
     /// a hand-tuned shorter TTL would silently re-open replays.
     pub redis_url: Option<String>,
+    /// Optional Postgres connection URL selecting the claims ledger. `Some(url)`
+    /// records every accepted payment durably (connected AND migrated eagerly at
+    /// startup in `server::run`); `None` means no ledger at all — the gate keeps
+    /// gating, but accepted payments leave no record to settle from.
+    pub database_url: Option<String>,
 }
 
 impl GatewayConfig {
@@ -101,6 +107,11 @@ impl GatewayConfig {
         // where the eager-connect fails startup fast. `None` = in-memory store.
         let redis_url = env::var("TOLLGATE_REDIS_URL").ok();
 
+        // Same shape and same reasoning as `redis_url`: unvalidated here, so a
+        // malformed URL surfaces as a connection failure at
+        // `PgClaimLedger::connect` in `server::run`. `None` = no claims ledger.
+        let database_url = env::var("TOLLGATE_DATABASE_URL").ok();
+
         // The asset/amount come from constants, so parse failures here would be
         // a programming error; propagate rather than panic to keep this path
         // panic-free.
@@ -134,6 +145,7 @@ impl GatewayConfig {
             upstream_timeout: DEFAULT_UPSTREAM_TIMEOUT,
             requirements,
             redis_url,
+            database_url,
         })
     }
 }
@@ -148,31 +160,44 @@ mod tests {
     use super::GatewayConfig;
     use std::env;
 
-    // `from_env` reads the process-global environment, so both cases live in a
+    // `from_env` reads the process-global environment, so every case lives in a
     // SINGLE `#[test]`: it is the only test in this binary that touches
-    // `TOLLGATE_REDIS_URL`, so keeping the unset→set→unset transitions in one
-    // sequential body avoids any cross-test race on the shared env. The var is
-    // removed again before returning so no state leaks to sibling tests.
+    // `TOLLGATE_REDIS_URL`/`TOLLGATE_DATABASE_URL`, so keeping the unset→set→unset
+    // transitions in one sequential body avoids any cross-test race on the shared
+    // env. Both vars are removed again before returning so no state leaks to
+    // sibling tests.
     #[test]
-    fn redis_url_env_selects_store_backend() {
-        // Unset: the default path keeps the in-memory backend (`None`).
+    fn redis_and_database_url_env_select_the_optional_backends() {
+        // Unset: the default path keeps the in-memory store and no claims ledger.
         env::remove_var("TOLLGATE_REDIS_URL");
+        env::remove_var("TOLLGATE_DATABASE_URL");
         let cfg = GatewayConfig::from_env().expect("defaults must build");
         assert_eq!(
             cfg.redis_url, None,
             "unset must leave the in-memory default"
         );
+        assert_eq!(
+            cfg.database_url, None,
+            "unset must leave the gateway with no claims ledger"
+        );
 
-        // Set: `Some(url)` selects Redis; the URL is carried through verbatim.
+        // Set: `Some(url)` selects each backend; the URLs carry through verbatim.
         env::set_var("TOLLGATE_REDIS_URL", "redis://127.0.0.1:6379");
+        env::set_var("TOLLGATE_DATABASE_URL", "postgres://user@127.0.0.1:5432/db");
         let cfg = GatewayConfig::from_env().expect("defaults must build");
         assert_eq!(
             cfg.redis_url.as_deref(),
             Some("redis://127.0.0.1:6379"),
             "set must select the Redis backend"
         );
+        assert_eq!(
+            cfg.database_url.as_deref(),
+            Some("postgres://user@127.0.0.1:5432/db"),
+            "set must select the Postgres claims ledger"
+        );
 
-        // Do not leak the var to other tests in this process.
+        // Do not leak the vars to other tests in this process.
         env::remove_var("TOLLGATE_REDIS_URL");
+        env::remove_var("TOLLGATE_DATABASE_URL");
     }
 }
